@@ -1,0 +1,83 @@
+---
+- hosts: all
+  become: true
+
+  tasks:
+  - name: gather ec2 facts
+    action: ec2_facts
+
+### GROUPS ####################################
+  - name: ensure wheel group exists
+    group:
+      name: wheel
+      state: present
+
+  - name: ensure docker group exists
+    group:
+      name: docker
+      state: present
+
+  - name: allow wheel group passwordless sudo
+    lineinfile:
+      dest: /etc/sudoers
+      state: present
+      regexp: '^%wheel'
+      line: '%wheel ALL=(ALL) NOPASSWD: ALL'
+      validate: visudo -cf %s
+
+### USERS #####################################
+  - name: add admin users 
+    user:
+      name: "{{ item.name }}"
+      groups: wheel
+      append: yes
+      state: present
+      shell: /bin/bash
+    with_items:
+       - { name: adickinson }
+       - { name: ekibalko }
+       - { name: ehumphrey }
+       - { name: gsundaram }
+
+### USERS #####################################
+  - name: add admin users 
+    user:
+      name: "{{ item.name }}"
+      groups: docker
+      append: yes
+      state: present
+      shell: /bin/bash
+    with_items:
+       - { name: adickinson }
+       - { name: ekibalko }
+       - { name: ehumphrey }
+       - { name: gsundaram }
+
+  - name: add authorized keys for admin users
+    authorized_key:
+      user: "{{ item.user }}"
+      state: present
+      manage_dir: yes
+      key: "{{ item.key }}"
+    with_items:
+       - { user: adickinson, key: "{{ lookup('file', '/Users/adickinson/infra-ansible/files/adickinson.pub') }}" }
+       - { user: ekibalko, key: "{{ lookup('file', '/Users/adickinson/infra-ansible/files/ekibalko.pub') }}" }
+       - { user: ehumphrey, key: "{{ lookup('file', '/Users/adickinson/infra-ansible/files/ehumphrey.pub') }}" }
+       - { user: gsundaram, key: "{{ lookup('file', '/Users/adickinson/infra-ansible/files/gsundaram.pub') }}" }    
+
+## These are needed because I haven't figured out (yet) how ssh-hardening is locking user accounts
+
+  - name: unlock admin user accounts
+    command: usermod -p "*" "{{ item.command }}"
+    become: true
+    with_items:
+       - { command: adickinson }
+       - { command: ekibalko }
+       - { command: ehumphrey }
+       - { command: gsundaram }
+
+  - name: fix password expiration for created users
+    raw: chage --maxdays 90 adickinson && chage --maxdays 90 ekibalko && chage --maxdays 90 ehumphrey && chage --maxdays 90 gsundaram
+
+  - name: fix password expiration for created users
+    raw: chage --mindays 7 adickinson && chage --mindays 7 ekibalko && chage --mindays 7 ehumphrey && chage --mindays 7 gsundaram

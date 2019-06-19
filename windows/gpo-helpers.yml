@@ -1,0 +1,15 @@
+---
+- hosts: all
+  become: true
+
+  tasks:
+  - name: gather ec2 facts
+    action: ec2_metadata_facts
+
+  - name: Add GPO helper files
+    win_copy: 
+      src: "{{ item.src }}"
+      dest: "{{ item.dest }}"
+    with_items:
+      - { src: "files/WPN.admx", dest: "C:/Windows/PolicyDefinitions/WPN.admx" }
+      - { src: "files/WPN.adml", dest: "C:/Windows/PolicyDefinitions/en-US/WPN.adml" }
