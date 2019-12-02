@@ -16,7 +16,7 @@
 
   tasks:
   - name: gather ec2 facts
-    action: ec2_facts
+    action: ec2_metadata_facts
 
 # Hashed password created with mkpasswd
 # Command used is "mkpasswd --method=sha-512"
@@ -32,12 +32,12 @@
       update_password: on_create
     register: name
     with_items:
-       - { name: mphillips, password: '$6$zdGcK84hN6Dg3$VlDHLXZiVtYtnaT3x2hMjB5DCwYRbSC2uNYOdeKNGtmJsU.L.DRzCDn.9kZqjS6/pJnaJvCQwutSBmhNgvlBV1'}
+       - { name: te, password: '$6$zRySB91pMWdEvP$kf0rtXgfwSN5UhHzXdKhRe2pZ7vWfSLZu6qI7gcO6b3c812mfEjcRwEZCzCCqA9RdVA7L5.XrrDMqsaHHeF3F1'}
        
   - name: Force users to change password
     shell: chage -d 0 "{{ item.user }}"
     with_items:
-      - { user: mphillips }
+      - { user: teccleston }
     when: name.changed
 
   - name: add symlink to /home/username
@@ -48,4 +48,4 @@
       group: "{{ item.group }}"
       state: link
     with_items:
-       - { src: /u/userhome/mphillips, dest: /home/mphillips, owner: mphillips, group: mphillips }
+       - { src: /u/userhome/teccleston, dest: /home/teccleston, owner: teccleston, group: teccleston }
