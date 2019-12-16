@@ -10,7 +10,7 @@ Powershell Module for SharePoint (command below)
 PS> Install-Module SharePointPnPPowerShellOnline
 ```
 
-Get user list and save as .csv
+Get user list and save as .csv (example output is provided in file "UsersToPreProv1.csv")
 ```
 PS> Connect-MSOLService
 PS> Get-MSOLUser | Where-Object { $_.isLicensed -eq "True"} | Select-Object DisplayName, UserPrincipalName, isLicensed | Export-Csv C:\temp\Users.csv
