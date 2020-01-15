@@ -8,12 +8,15 @@ Microsoft Online Services Sign-In Assistant for IT Professionals RTW - https://w
 Powershell Module for SharePoint (command below) 
 ```
 PS> Install-Module SharePointPnPPowerShellOnline
+PS> Install-Module Microsoft.Online.SharePoint.PowerShell
+PS> Install-Module AzureAD
+PS> Install-Module MSOnline
 ```
 
 Get user list and save as .csv (example output is provided in file "UsersToPreProv1.csv")
 ```
 PS> Connect-MSOLService
-PS> Get-MSOLUser | Where-Object { $_.isLicensed -eq "True"} | Select-Object DisplayName, UserPrincipalName, isLicensed | Export-Csv C:\temp\Users.csv
+PS> Get-MSOLUser | Where-Object { $_.isLicensed -eq "True"} | Select-Object DisplayName, UserPrincipalName, isLicensed | Export-Csv C:\temp\UsersToPreProv1.csv
 ```
 
 ## Run the script:
