@@ -15,8 +15,8 @@ $ODFBurls | Select-Object PersonalUrl | Export-Csv -Path "C:\users\$env:USERNAME
 Connect-SPOService -Url https://axialhealthcare-admin.sharepoint.com
 #Import users
 $userURLs = Import-Csv -Path "C:\users\$env:USERNAME\scripts\URLs.csv"
-#Store 2nd Admin account into a variable
-$adminAcctToAdd = "adickinson@axialhealthcare.com"
+#Store 2nd Admin account into a variable, change "username@axialhealthcare.com" to an actual administrator.
+$adminAcctToAdd = "username@axialhealthcare.com"
 #Add 2nd Site Collection admin
 foreach ($url in $userURLS) {
     Write-Host "Connecting to: $($url.PersonalUrl) and adding user $($adminAcctToAdd)" -ForegroundColor Green
@@ -33,8 +33,8 @@ foreach ($url in $userURLs) {
 
 #Import users
 $userURLs = Import-Csv -Path "C:\users\$env:USERNAME\scripts\URLs.csv"
-#Store 2nd Admin account into a variable
-$adminAcctToRemove = "adickinson@axialhealthcare.com"
+#Store 2nd Admin account into a variable, change "username@axialhealthcare.com" to an actual administrator.
+$adminAcctToRemove = "username@axialhealthcare.com"
 #Remove 2nd Site Collection admin
 foreach ($url in $userURLs) {
     Write-Host "Connecting to: $($url.PersonalUrl) and Removing user $($adminAcctToRemove)" -ForegroundColor Green
