@@ -32,12 +32,12 @@
       update_password: on_create
     register: name
     with_items:
-       - { name: te, password: '$6$zRySB91pMWdEvP$kf0rtXgfwSN5UhHzXdKhRe2pZ7vWfSLZu6qI7gcO6b3c812mfEjcRwEZCzCCqA9RdVA7L5.XrrDMqsaHHeF3F1'}
+       - { name: evilla, password: '$6$nI0o24U7w$H0bdsFyUSwmr9B7QfJT7JmsLTqgAEmjsayN68/PMh1EUdxgodLHeRdmydO.Ssca3zwfEV/TCqbaZt1biE9hzD.'}
        
   - name: Force users to change password
     shell: chage -d 0 "{{ item.user }}"
     with_items:
-      - { user: teccleston }
+      - { user: evilla }
     when: name.changed
 
   - name: add symlink to /home/username
@@ -48,4 +48,4 @@
       group: "{{ item.group }}"
       state: link
     with_items:
-       - { src: /u/userhome/teccleston, dest: /home/teccleston, owner: teccleston, group: teccleston }
+       - { src: /u/userhome/evilla, dest: /home/evilla, owner: evilla, group: evilla }
