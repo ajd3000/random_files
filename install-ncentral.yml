@@ -1,0 +1,74 @@
+---
+- hosts: all
+  become: true
+  become_method: sudo
+  become_user: root
+  gather_facts: true
+
+  vars:
+    brand_customerid: "{{id}}"
+    brand_customername: "{{custname}}"
+    brand_registrationtoken: "{{token}}"
+    file_urls:
+      Ubuntu:
+        20: https://edr-software-setup.s3.us-west-2.amazonaws.com/nagent-ubuntu20_64.tar.gz
+        22: https://edr-software-setup.s3.us-west-2.amazonaws.com/nagent-ubuntu22_64.tar.gz
+      CentOS:
+        7: https://edr-software-setup.s3.us-west-2.amazonaws.com/nagent-rhel7_64.tar.gz
+        8: https://edr-software-setup.s3.us-west-2.amazonaws.com/nagent-rhel8_64.tar.gz
+
+  tasks:
+    - name: debug gathered facts
+      debug:
+        msg: "OS Distribution: {{ ansible_facts['distribution'] }}, Distribution Major version: {{ ansible_facts['distribution_major_version'] }}"
+
+    - name: check if n-central exists
+      ansible.builtin.stat:
+        path: /usr/sbin/nagent
+      become: true
+      register: ncentral_exists
+    
+    - name: Create temporary folder to place the installer    
+      ansible.builtin.file:
+        path: /cet-files/nagent-installer/
+        state: directory
+        mode: '0755'
+      when: ncentral_exists.stat.exists == False
+
+    - name: Check if OS family and version combination exists
+      ansible.builtin.set_fact:
+        download_url: "{{ file_urls.get(ansible_facts['distribution'], {}).get(ansible_facts['distribution_major_version'] | int, '') }}"
+      when: ncentral_exists.stat.exists == False
+
+    - name: Debug the distro and version keys
+      debug:
+        msg: "Checking the URL for distribution: {{ ansible_facts['distribution'] }} and version: {{ ansible_facts['distribution_major_version'] }}"
+      when: ncentral_exists.stat.exists == False
+
+    - name: Debug the download URL
+      debug:
+        msg: "Download URL is {{ download_url }}"
+      when: ncentral_exists.stat.exists == False
+
+    - name: Fail if the combination of OS distribution and version is not found
+      fail:
+        msg: "The combination of OS distribution {{ ansible_facts['distribution'] }} and version {{ ansible_facts['distribution_major_version'] }} is not supported."
+      when: ncentral_exists.stat.exists == False and download_url == ''
+
+    - name: Download nagent Installer
+      ansible.builtin.get_url:
+        url: "{{ download_url }}"
+        dest: "/cet-files/{{ download_url | basename }}"
+      when: ncentral_exists.stat.exists == False and download_url != ''
+
+    - name: Extract tar.gz file
+      ansible.builtin.unarchive:
+        src: "/cet-files/{{ download_url | basename }}"
+        dest: /cet-files/nagent-installer/
+        extra_opts: ['--strip-components=1', '--show-stored-names']
+        remote_src: True
+      when: ncentral_exists.stat.exists == False and download_url != ''
+
+    - name: Change directory and Install the N-Central Agent
+      shell: cd /cet-files/nagent-installer && ./install.sh -c "{{ custname }}" -i "{{ id }}" -s nc.inhabitiq.net -p https -a 443 -t "{{ token }}" 
+      when: ncentral_exists.stat.exists == False and download_url != ''
