@@ -7,6 +7,10 @@ Checks (script "services"):
   --volumes     Orphaned/available EBS volumes (not attached)
   --eip         Elastic IPs not associated with a resource
   --stopped     EC2 instances stopped longer than --stopped-age (default 180d)
+  --nat         NAT gateways (flags idle via CloudWatch BytesOutToDestination)
+  --elb         Load balancers with no targets or no healthy targets (ALB/NLB/CLB)
+  --ami         Self-owned AMIs older than --ami-age (default 90d)
+  --logs        CloudWatch log groups with no retention and/or size >= --log-min-gib
 
 Account selection:
   --allaccounts     All AWS CLI profiles ending in -RO
@@ -33,11 +37,24 @@ except ImportError:  # pragma: no cover - help still works without boto3
     BotoCoreError = ClientError = Exception  # type: ignore[misc,assignment]
 
 SSO_SESSION = "inhabit-sso"
-DEFAULT_REGIONS = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"]
+DEFAULT_REGIONS = ["us-east-1", "us-east-2", "us-west-1", "us-west-2", "eu-west-2", "ca-central-1"]
 DEFAULT_SNAPSHOT_AGE_DAYS = 30
 DEFAULT_STOPPED_AGE_DAYS = 180
+DEFAULT_AMI_AGE_DAYS = 90
+DEFAULT_LOG_MIN_GIB = 5.0
+DEFAULT_NAT_IDLE_DAYS = 14
 
-SERVICES = ("snapshots", "volumes", "eip", "stopped")
+SERVICES = (
+    "snapshots",
+    "volumes",
+    "eip",
+    "stopped",
+    "nat",
+    "elb",
+    "ami",
+    "logs",
+)
+SERVICE_FLAGS = " ".join(f"--{s}" for s in SERVICES)
 
 CSV_HEADERS = [
     "Check",
@@ -365,12 +382,319 @@ def scan_stopped(
     return out
 
 
+def nat_bytes_out_sum(cloudwatch, nat_id: str, days: int, now: datetime) -> Optional[float]:
+    try:
+        resp = cloudwatch.get_metric_statistics(
+            Namespace="AWS/NATGateway",
+            MetricName="BytesOutToDestination",
+            Dimensions=[{"Name": "NatGatewayId", "Value": nat_id}],
+            StartTime=now - timedelta(days=days),
+            EndTime=now,
+            Period=max(days, 1) * 86400,
+            Statistics=["Sum"],
+        )
+    except (ClientError, BotoCoreError):
+        return None
+    points = resp.get("Datapoints") or []
+    if not points:
+        return 0.0
+    return float(sum(p.get("Sum") or 0.0 for p in points))
+
+
+def scan_nat(
+    ec2,
+    cloudwatch,
+    *,
+    account_id: str,
+    account_name: str,
+    profile: str,
+    region: str,
+    now: datetime,
+    idle_days: int,
+) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    paginator = ec2.get_paginator("describe_nat_gateways")
+    for page in paginator.paginate(
+        Filters=[{"Name": "state", "Values": ["available", "pending"]}]
+    ):
+        for nat in page.get("NatGateways", []):
+            created = nat.get("CreateTime")
+            if isinstance(created, datetime) and created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            nat_id = nat["NatGatewayId"]
+            bytes_out = nat_bytes_out_sum(cloudwatch, nat_id, idle_days, now)
+            if bytes_out is None:
+                activity = "metric-unavailable"
+            elif bytes_out <= 0:
+                activity = f"idle/{idle_days}d"
+            else:
+                activity = f"active/{idle_days}d"
+            # Always report NAT GWs (fixed hourly cost); idle called out in Detail.
+            public_ips = []
+            for addr in nat.get("NatGatewayAddresses") or []:
+                if addr.get("PublicIp"):
+                    public_ips.append(addr["PublicIp"])
+            out.append(
+                row(
+                    "nat",
+                    account_id,
+                    account_name,
+                    profile,
+                    region,
+                    nat_id,
+                    tag_name(nat.get("Tags")),
+                    activity,
+                    age=age_days(created, now) if isinstance(created, datetime) else None,
+                    when=created if isinstance(created, datetime) else None,
+                    extra=(
+                        f"vpc={nat.get('VpcId') or 'N/A'};"
+                        f"subnet={nat.get('SubnetId') or 'N/A'};"
+                        f"bytes_out_{idle_days}d={bytes_out if bytes_out is not None else 'N/A'};"
+                        f"public_ip={','.join(public_ips) or 'N/A'}"
+                    ),
+                )
+            )
+    return out
+
+
+def _elb_v2_target_counts(elbv2, lb_arn: str) -> Tuple[int, int]:
+    """Return (registered_targets, healthy_targets) across all target groups."""
+    registered = 0
+    healthy = 0
+    tg_paginator = elbv2.get_paginator("describe_target_groups")
+    for page in tg_paginator.paginate(LoadBalancerArn=lb_arn):
+        for tg in page.get("TargetGroups", []):
+            try:
+                health = elbv2.describe_target_health(
+                    TargetGroupArn=tg["TargetGroupArn"]
+                )
+            except (ClientError, BotoCoreError):
+                continue
+            for th in health.get("TargetHealthDescriptions", []):
+                registered += 1
+                state = (th.get("TargetHealth") or {}).get("State")
+                if state == "healthy":
+                    healthy += 1
+    return registered, healthy
+
+
+def scan_elb(
+    elbv2,
+    elb,
+    *,
+    account_id: str,
+    account_name: str,
+    profile: str,
+    region: str,
+    now: datetime,
+) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+
+    # Application / Network / Gateway Load Balancers
+    try:
+        paginator = elbv2.get_paginator("describe_load_balancers")
+        for page in paginator.paginate():
+            for lb in page.get("LoadBalancers", []):
+                created = lb.get("CreatedTime")
+                if isinstance(created, datetime) and created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                lb_arn = lb["LoadBalancerArn"]
+                registered, healthy = _elb_v2_target_counts(elbv2, lb_arn)
+                if registered > 0 and healthy > 0:
+                    continue
+                if registered == 0:
+                    detail = "no-targets"
+                else:
+                    detail = f"no-healthy-targets/{registered}-registered"
+                name = lb.get("LoadBalancerName") or "N/A"
+                out.append(
+                    row(
+                        "elb",
+                        account_id,
+                        account_name,
+                        profile,
+                        region,
+                        lb_arn,
+                        name,
+                        detail,
+                        age=age_days(created, now) if isinstance(created, datetime) else None,
+                        when=created if isinstance(created, datetime) else None,
+                        extra=(
+                            f"type={lb.get('Type') or 'N/A'};"
+                            f"scheme={lb.get('Scheme') or 'N/A'};"
+                            f"state={(lb.get('State') or {}).get('Code') or 'N/A'}"
+                        ),
+                    )
+                )
+    except (ClientError, BotoCoreError) as exc:
+        eprint(f"    elbv2: {exc}")
+
+    # Classic Load Balancers
+    try:
+        paginator = elb.get_paginator("describe_load_balancers")
+        for page in paginator.paginate():
+            for lb in page.get("LoadBalancerDescriptions", []):
+                name = lb.get("LoadBalancerName") or "N/A"
+                created = lb.get("CreatedTime")
+                if isinstance(created, datetime) and created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                instances = lb.get("Instances") or []
+                registered = len(instances)
+                healthy = 0
+                if instances:
+                    try:
+                        health = elb.describe_instance_health(LoadBalancerName=name)
+                        for ih in health.get("InstanceStates", []):
+                            if ih.get("State") == "InService":
+                                healthy += 1
+                    except (ClientError, BotoCoreError):
+                        pass
+                if registered > 0 and healthy > 0:
+                    continue
+                if registered == 0:
+                    detail = "no-targets"
+                else:
+                    detail = f"no-healthy-targets/{registered}-registered"
+                out.append(
+                    row(
+                        "elb",
+                        account_id,
+                        account_name,
+                        profile,
+                        region,
+                        name,
+                        name,
+                        detail,
+                        age=age_days(created, now) if isinstance(created, datetime) else None,
+                        when=created if isinstance(created, datetime) else None,
+                        extra="type=classic;scheme=" + (lb.get("Scheme") or "N/A"),
+                    )
+                )
+    except (ClientError, BotoCoreError) as exc:
+        eprint(f"    classic-elb: {exc}")
+
+    return out
+
+
+def scan_ami(
+    ec2,
+    *,
+    account_id: str,
+    account_name: str,
+    profile: str,
+    region: str,
+    cutoff: datetime,
+    now: datetime,
+) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    images = ec2.describe_images(Owners=["self"]).get("Images", [])
+    for image in images:
+        created_raw = image.get("CreationDate")
+        created: Optional[datetime] = None
+        if created_raw:
+            try:
+                created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+            except ValueError:
+                created = None
+        if created is None or created >= cutoff:
+            continue
+        snap_ids = []
+        for bdm in image.get("BlockDeviceMappings") or []:
+            ebs = bdm.get("Ebs") or {}
+            if ebs.get("SnapshotId"):
+                snap_ids.append(ebs["SnapshotId"])
+        out.append(
+            row(
+                "ami",
+                account_id,
+                account_name,
+                profile,
+                region,
+                image["ImageId"],
+                image.get("Name") or tag_name(image.get("Tags")),
+                image.get("Description") or "N/A",
+                age=age_days(created, now),
+                when=created,
+                extra=(
+                    f"state={image.get('State') or 'N/A'};"
+                    f"public={image.get('Public')};"
+                    f"snapshots={','.join(snap_ids) or 'N/A'}"
+                ),
+            )
+        )
+    return out
+
+
+def scan_logs(
+    logs,
+    *,
+    account_id: str,
+    account_name: str,
+    profile: str,
+    region: str,
+    now: datetime,
+    min_gib: float,
+) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    paginator = logs.get_paginator("describe_log_groups")
+    for page in paginator.paginate():
+        for group in page.get("logGroups", []):
+            retention = group.get("retentionInDays")
+            stored = float(group.get("storedBytes") or 0)
+            size_gib = stored / (1024.0 ** 3)
+            never_expire = retention is None
+            oversized = size_gib >= min_gib
+            if not never_expire and not oversized:
+                continue
+            reasons = []
+            if never_expire:
+                reasons.append("never-expire")
+            if oversized:
+                reasons.append(f"size>={min_gib:g}GiB")
+            created_ms = group.get("creationTime")
+            created = None
+            if created_ms is not None:
+                created = datetime.fromtimestamp(created_ms / 1000.0, tz=timezone.utc)
+            out.append(
+                row(
+                    "logs",
+                    account_id,
+                    account_name,
+                    profile,
+                    region,
+                    group.get("logGroupName") or "N/A",
+                    group.get("logGroupName") or "N/A",
+                    "+".join(reasons),
+                    age=age_days(created, now) if created else None,
+                    when=created,
+                    size_gib=round(size_gib, 3),
+                    extra=(
+                        f"retention={retention if retention is not None else 'Never'};"
+                        f"storedBytes={int(stored)}"
+                    ),
+                )
+            )
+    return out
+
+
+def _run_check(label: str, region: str, fn) -> List[Dict[str, str]]:
+    try:
+        return fn()
+    except (ClientError, BotoCoreError) as exc:
+        eprint(f"  [{region}] {label}: {exc}")
+        return []
+
+
 def scan_profile(
     profile: str,
     regions: Sequence[str],
     services: Sequence[str],
+    *,
     snapshot_cutoff: datetime,
     stopped_cutoff: datetime,
+    ami_cutoff: datetime,
+    log_min_gib: float,
+    nat_idle_days: int,
     now: datetime,
 ) -> List[Dict[str, str]]:
     session = boto3.Session(profile_name=profile)
@@ -382,58 +706,97 @@ def scan_profile(
 
     eprint(f"[{profile}] {account_name} ({account_id})")
     findings: List[Dict[str, str]] = []
+    base = dict(account_id=account_id, account_name=account_name, profile=profile)
 
     for region in regions:
-        ec2 = session.client("ec2", region_name=region)
         eprint(f"  [{region}] scanning: {', '.join(services)}")
-        try:
-            if "snapshots" in services:
-                findings.extend(
-                    scan_snapshots(
+        ec2 = session.client("ec2", region_name=region)
+
+        if "snapshots" in services:
+            findings.extend(
+                _run_check(
+                    "snapshots",
+                    region,
+                    lambda: scan_snapshots(
+                        ec2, region=region, cutoff=snapshot_cutoff, now=now, **base
+                    ),
+                )
+            )
+        if "volumes" in services:
+            findings.extend(
+                _run_check(
+                    "volumes",
+                    region,
+                    lambda: scan_volumes(ec2, region=region, now=now, **base),
+                )
+            )
+        if "eip" in services:
+            findings.extend(
+                _run_check(
+                    "eip",
+                    region,
+                    lambda: scan_eips(ec2, region=region, **base),
+                )
+            )
+        if "stopped" in services:
+            findings.extend(
+                _run_check(
+                    "stopped",
+                    region,
+                    lambda: scan_stopped(
+                        ec2, region=region, cutoff=stopped_cutoff, now=now, **base
+                    ),
+                )
+            )
+        if "nat" in services:
+            cw = session.client("cloudwatch", region_name=region)
+            findings.extend(
+                _run_check(
+                    "nat",
+                    region,
+                    lambda: scan_nat(
                         ec2,
-                        account_id=account_id,
-                        account_name=account_name,
-                        profile=profile,
+                        cw,
                         region=region,
-                        cutoff=snapshot_cutoff,
                         now=now,
-                    )
+                        idle_days=nat_idle_days,
+                        **base,
+                    ),
                 )
-            if "volumes" in services:
-                findings.extend(
-                    scan_volumes(
-                        ec2,
-                        account_id=account_id,
-                        account_name=account_name,
-                        profile=profile,
-                        region=region,
-                        now=now,
-                    )
+            )
+        if "elb" in services:
+            elbv2 = session.client("elbv2", region_name=region)
+            elb = session.client("elb", region_name=region)
+            findings.extend(
+                _run_check(
+                    "elb",
+                    region,
+                    lambda: scan_elb(
+                        elbv2, elb, region=region, now=now, **base
+                    ),
                 )
-            if "eip" in services:
-                findings.extend(
-                    scan_eips(
-                        ec2,
-                        account_id=account_id,
-                        account_name=account_name,
-                        profile=profile,
-                        region=region,
-                    )
+            )
+        if "ami" in services:
+            findings.extend(
+                _run_check(
+                    "ami",
+                    region,
+                    lambda: scan_ami(
+                        ec2, region=region, cutoff=ami_cutoff, now=now, **base
+                    ),
                 )
-            if "stopped" in services:
-                findings.extend(
-                    scan_stopped(
-                        ec2,
-                        account_id=account_id,
-                        account_name=account_name,
-                        profile=profile,
-                        region=region,
-                        cutoff=stopped_cutoff,
-                        now=now,
-                    )
+            )
+        if "logs" in services:
+            logs = session.client("logs", region_name=region)
+            findings.extend(
+                _run_check(
+                    "logs",
+                    region,
+                    lambda: scan_logs(
+                        logs, region=region, now=now, min_gib=log_min_gib, **base
+                    ),
                 )
-        except (ClientError, BotoCoreError) as exc:
-            eprint(f"  [{region}] skip/error: {exc}")
+            )
 
     return findings
 
@@ -448,19 +811,21 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""
 Required (pick one from each group):
   Accounts:  --allaccounts | --account NAME
-  Services:  --allservices | one or more of --snapshots --volumes --eip --stopped
+  Services:  --allservices | one or more of """
+            + SERVICE_FLAGS
+            + """
 
 Examples:
   %(prog)s --allaccounts --allservices
   %(prog)s --account IIQ-Corp --snapshots --eip
-  %(prog)s --account IIQ-Corp-RO --stopped --region eu-west-1
-  %(prog)s --allaccounts --volumes --stopped --snapshot-age 30d --stopped-age 180d
+  %(prog)s --account IIQ-Corp-RO --nat --elb --logs
+  %(prog)s --allaccounts --ami --ami-age 90d
   %(prog)s --allaccounts --allservices -o hygiene-report.csv
 
 Notes:
   - Only profiles ending in -RO are used.
-  - Default regions: us-east-1 us-east-2 us-west-1 us-west-2
-  - --region replaces the US default (repeatable / space-separated).
+  - Default regions: us-east-1 us-east-2 us-west-1 us-west-2 eu-west-2 ca-central-1
+  - --region replaces the default region list (repeatable / space-separated).
   - First run may open a browser for: aws sso login --sso-session inhabit-sso
 """.rstrip(),
     )
@@ -482,7 +847,7 @@ Notes:
     services.add_argument(
         "--allservices",
         action="store_true",
-        help="Run all script checks: snapshots, volumes, eip, stopped",
+        help="Run all script checks: " + ", ".join(SERVICES),
     )
     services.add_argument(
         "--snapshots",
@@ -504,6 +869,32 @@ Notes:
         action="store_true",
         help=f"EC2 instances stopped longer than --stopped-age (default {DEFAULT_STOPPED_AGE_DAYS}d)",
     )
+    services.add_argument(
+        "--nat",
+        action="store_true",
+        help=(
+            "NAT gateways (all listed; Detail marks idle when "
+            f"BytesOutToDestination is 0 over --nat-idle-days, default {DEFAULT_NAT_IDLE_DAYS}d)"
+        ),
+    )
+    services.add_argument(
+        "--elb",
+        action="store_true",
+        help="ALB/NLB/CLB with no targets or no healthy targets",
+    )
+    services.add_argument(
+        "--ami",
+        action="store_true",
+        help=f"Self-owned AMIs older than --ami-age (default {DEFAULT_AMI_AGE_DAYS}d)",
+    )
+    services.add_argument(
+        "--logs",
+        action="store_true",
+        help=(
+            "CloudWatch log groups with never-expire retention and/or "
+            f"stored size >= --log-min-gib (default {DEFAULT_LOG_MIN_GIB:g} GiB)"
+        ),
+    )
 
     parser.add_argument(
         "--region",
@@ -512,7 +903,7 @@ Notes:
         nargs="+",
         metavar="REGION",
         help=(
-            "Region(s) to scan instead of the four US defaults. "
+            "Region(s) to scan instead of the default region list. "
             "Repeatable, e.g. --region eu-west-1 --region ap-southeast-2"
         ),
     )
@@ -529,6 +920,33 @@ Notes:
         type=lambda v: parse_duration_days(v, "--stopped-age"),
         metavar="DAYS",
         help=f"Stopped-instance age threshold (default: {DEFAULT_STOPPED_AGE_DAYS}d)",
+    )
+    parser.add_argument(
+        "--ami-age",
+        default=f"{DEFAULT_AMI_AGE_DAYS}d",
+        type=lambda v: parse_duration_days(v, "--ami-age"),
+        metavar="DAYS",
+        help=f"AMI age threshold (default: {DEFAULT_AMI_AGE_DAYS}d)",
+    )
+    parser.add_argument(
+        "--nat-idle-days",
+        default=f"{DEFAULT_NAT_IDLE_DAYS}d",
+        type=lambda v: parse_duration_days(v, "--nat-idle-days"),
+        metavar="DAYS",
+        help=(
+            "CloudWatch window for NAT BytesOutToDestination idle check "
+            f"(default: {DEFAULT_NAT_IDLE_DAYS}d)"
+        ),
+    )
+    parser.add_argument(
+        "--log-min-gib",
+        type=float,
+        default=DEFAULT_LOG_MIN_GIB,
+        metavar="GiB",
+        help=(
+            "Also flag log groups at/above this stored size even if retention is set "
+            f"(default: {DEFAULT_LOG_MIN_GIB:g})"
+        ),
     )
     parser.add_argument(
         "-o",
@@ -568,11 +986,11 @@ def validate_required(args: argparse.Namespace, parser: argparse.ArgumentParser)
 
     individual = any(getattr(args, s) for s in SERVICES)
     if not args.allservices and not individual:
-        errors.append(
-            "choose --allservices or one/more of --snapshots --volumes --eip --stopped"
-        )
+        errors.append(f"choose --allservices or one/more of {SERVICE_FLAGS}")
     if args.allservices and individual:
         errors.append("use --allservices alone, or individual service flags (not both)")
+    if args.log_min_gib < 0:
+        errors.append("--log-min-gib must be >= 0")
 
     if errors:
         parser.print_help()
@@ -611,7 +1029,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     eprint(f"Services: {', '.join(services)}")
     eprint(f"Regions: {', '.join(regions)}")
     eprint(
-        f"Thresholds: snapshots>{args.snapshot_age}d  stopped>{args.stopped_age}d"
+        "Thresholds: "
+        f"snapshots>{args.snapshot_age}d  stopped>{args.stopped_age}d  "
+        f"ami>{args.ami_age}d  nat-idle={args.nat_idle_days}d  "
+        f"log-min={args.log_min_gib:g}GiB"
     )
 
     ensure_sso(profiles[0])
@@ -619,6 +1040,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     now = datetime.now(timezone.utc)
     snapshot_cutoff = now - timedelta(days=args.snapshot_age)
     stopped_cutoff = now - timedelta(days=args.stopped_age)
+    ami_cutoff = now - timedelta(days=args.ami_age)
 
     all_rows: List[Dict[str, str]] = []
     for profile in profiles:
@@ -627,9 +1049,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 profile,
                 regions,
                 services,
-                snapshot_cutoff,
-                stopped_cutoff,
-                now,
+                snapshot_cutoff=snapshot_cutoff,
+                stopped_cutoff=stopped_cutoff,
+                ami_cutoff=ami_cutoff,
+                log_min_gib=args.log_min_gib,
+                nat_idle_days=args.nat_idle_days,
+                now=now,
             )
         )
 
